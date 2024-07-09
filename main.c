@@ -5,6 +5,8 @@
 #include <byteswap.h>
 #include <sys/mman.h>
 #include <limits.h>
+#include <ctype.h>
+#include <sys/stat.h>
 #include "ext_internal.h"
 
 #define ASDF_MAGIC_TOKEN "#ASDF "
@@ -60,6 +62,7 @@ struct ASDFBlockHeader {
 struct ASDFHandle {
     FILE *fp;                      // File handle
     const char *fp_origin;         // Path to file
+    size_t fp_size;                // Size of file
     unsigned last_error;           // Last ASDF error recorded (default: ASDF_E_SUCCESS)
     off_t pos;                     // Current position in file
     off_t block_index_offset;      // Block header position in file
@@ -203,26 +206,40 @@ struct ASDFHandle *asdfapi_open(struct ASDFHandle **handle, const char *filename
         return NULL;
     }
 
+    // Get file size
+    struct stat st;
+    if (stat(filename, &st)) {
+        perror(filename);
+        free(*handle);
+        *handle = NULL;
+        return  NULL;
+    }
+    (*handle)->fp_size = st.st_size;
+
+    // Open file handle
     (*handle)->fp = fopen(filename, "rb+");
     if (!(*handle)->fp) {
+        free(*handle);
+        *handle = NULL;
         return NULL;
     }
 
+    // Store input file path
     (*handle)->fp_origin = filename;
     if (asdfapi_poll_version(*handle)) {
         fprintf(stderr, "failed to determine ASDF file version\n");
         return NULL;
     }
 
+    // Retrieve offset of ASDF block index
     (*handle)->block_index_offset = (off_t) asdfapi_poll_block_index_offset(*handle);
+    // Construct array of data block offsets
     (*handle)->block_offsets = asdfapi_get_block_index_array(*handle);
     if (!(*handle)->block_offsets) {
         perror("wtf?");
         return NULL;
     }
-    for (size_t i = 0; (*handle)->block_offsets[i] != 0; i++) {
-        printf("block[%zu] @ %zu\n", i, (*handle)->block_offsets[i]);
-    }
+
     return *handle;
 }
 
@@ -254,23 +271,46 @@ struct ASDFBlockHeader *asdfapi_read_block_header(struct ASDFHandle *handle, siz
     fread(result->checksum, sizeof(result->checksum), 1, handle->fp);
     result->data.offset = ftell(handle->fp);
     result->data.mfd = fileno(handle->fp);
-    off_t pa_offset = result->data.offset & ~(sysconf(_SC_PAGE_SIZE) - 1);
+
+    off_t offset = (off_t) result->data.offset;
+    // Offset must be a multiple of the system's page size
+    off_t pa_offset = (off_t) offset & ~(sysconf(_SC_PAGE_SIZE) - 1);
+
+    // used_size represents the logical data size
+    // NOTE: compressed blocks decompress to result->data_size
     size_t map_size = result->used_size;
     if (result->flags & ASDF_STREAM) {
-        map_size = result->size;
+        // A "stream" represents a file with no block index, and the data runs to the end of the file
+        map_size = handle->fp_size - offset;
     }
-    result->data.mem_region = mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, result->data.mfd, pa_offset);
+
+    if (offset > handle->fp_size) {
+        fprintf(stderr, "offset %zu is past end of file %zu\n", offset, handle->fp_size);
+        return NULL;
+    }
+
+    if (map_size + offset > handle->fp_size) {
+        map_size = handle->fp_size - offset;
+    }
+
+    // Memory map the ASDF data block
+    result->data.mem_region = mmap(NULL,
+                                   map_size + offset - pa_offset,
+                                   PROT_READ, MAP_PRIVATE | MAP_POPULATE,
+                                   result->data.mfd, pa_offset);
     if (result->data.mem_region == MAP_FAILED) {
         perror("mmap");
-        exit(1);
+        return NULL;
     }
-    result->data.mem = (char *) &result->data.mem_region[result->data.offset];
+    // Set mem pointer to the start of data in the block (does not include the header)
+    result->data.mem = (char *) &result->data.mem_region[offset - pa_offset];
 
     return result;
 }
 
 void asdfapi_show_block_header(struct ASDFBlockHeader *hdr) {
     printf("ASDF HEADER BLOCK\n");
+    printf("Data offset: %zu\n", hdr->data.offset);
     printf("Raw size: %u\n", hdr->size);
     printf("Allocated size: %zu\n", hdr->allocated_size);
     printf("Used size: %zu\n", hdr->used_size);
@@ -321,27 +361,86 @@ void asdfapi_show_block_header(struct ASDFBlockHeader *hdr) {
     printf("\n");
 }
 
+static void asdfapi_hexdump(const char *data, const size_t size) {
+    char addr[80] = {0};
+    char ascii[80] = {0};
+    char row[80] = {0};
+    size_t width = 16;
+    if (size < width) {
+        width = size;
+    }
+    for (size_t b = 0, col = 0; b < 16; b++) {
+        char ch = data[b];
+        if (!col) {
+            // Record the starting address
+            sprintf(addr, "%08lx", b + (intptr_t) data);
+        }
+
+        if (col >= width) {
+            sprintf(row + strlen(row), "00 ");
+            sprintf(ascii + strlen(ascii), ".");
+        } else {
+            // Store byte as hex
+            sprintf(row + strlen(row), "%02x ", (unsigned char) ch);
+            // Store byte as ascii
+            sprintf(ascii + strlen(ascii), "%c", isprint(ch) ? (unsigned char) ch : '.');
+        }
+        if (col == 7) {
+            // Inject two spaces to visually break up the line
+            sprintf(row + strlen(row), "  ");
+        }
+        if (col >= 16) {
+            // Dump output / reset counters and strings
+            printf("%s  %s| %s\n", addr, row, ascii);
+            col = 0;
+            row[col] = 0;
+            ascii[col] = 0;
+            addr[col] = 0;
+            continue;
+        }
+        col++;
+    }
+    if (strlen(row)) {
+        // Dump remaining output
+        printf("%s  %s| %s\n", addr, row, ascii);
+    }
+}
+
 int main(int argc, char *argv[]) {
-    const char *filename = "../ascii.asdf";
+    const char *filename = argv[1];
+    if (argc < 2) {
+        fprintf(stderr, "missing path to ASDF file\n");
+        exit(1);
+    }
     printf("Opening %s\n", filename);
     struct ASDFHandle *handle = NULL;
-    asdfapi_open(&handle, filename);
+    handle = asdfapi_open(&handle, filename);
     if (!handle) {
         perror(filename);
         exit(1);
     }
-
     printf("ASDF file version: %s\n", handle->version.raw);
 
     if (handle->block_offsets) {
         for (size_t i = 0; handle->block_offsets[i] != 0; i++) {
             struct ASDFBlockHeader *block_hdr = asdfapi_read_block_header(handle, i);
+            size_t used_size = block_hdr->used_size;
+
             asdfapi_show_block_header(block_hdr);
-            puts("");
-            for (size_t b = 0; b < block_hdr->used_size / sizeof(char); b++) {
-                printf("%c ", (char) block_hdr->data.mem[b]);
+            puts("\nBYTES");
+            if (!used_size) {
+                // stream mode
+                used_size = handle->fp_size - handle->block_offsets[0];
+            }
+            if (used_size > 128) {
+                asdfapi_hexdump(block_hdr->data.mem, 128);
+                puts("[output too long for terminal]");
+            } else {
+                asdfapi_hexdump(block_hdr->data.mem, used_size);
             }
             puts("\n");
+
+
             asdfapi_free_block_header(&block_hdr);
         }
     }
