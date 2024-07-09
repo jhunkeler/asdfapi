@@ -361,49 +361,37 @@ void asdfapi_show_block_header(struct ASDFBlockHeader *hdr) {
     printf("\n");
 }
 
-static void asdfapi_hexdump(const char *data, const size_t size) {
-    char addr[80] = {0};
-    char ascii[80] = {0};
-    char row[80] = {0};
-    size_t width = 16;
-    if (size < width) {
-        width = size;
+static void asdfapi_hexdump(const char *data, size_t offset, const size_t size) {
+    char ascii[255] = {0};
+    size_t width = 15;
+    if (size < 1) {
+        fprintf(stderr, "size must be greater than zero");
+        return;
+    } else if (offset > size) {
+        fprintf(stderr, "offset must be less than size\n");
+        return;
     }
-    for (size_t b = 0, col = 0; b < size; b++) {
-        char ch = data[b];
-        if (!col) {
-            // Record the starting address
-            sprintf(addr, "%08lx", b + (intptr_t) data);
+    for (size_t i = offset; i < size; i++) {
+        for (size_t x = 0; x <= width; x++) {
+            if (!x) {
+                printf("%#08lX | ", (size_t) data + i);
+            } else if (x == 8) {
+                printf(" ");
+            }
+            if ((i + x) >= size) {
+                printf("  ");
+                ascii[x] = ' ';
+            } else {
+                printf("%02X ", (unsigned char) data[i + x]);
+                ascii[x] = isprint(data[i + x]) ? data[i + x] : '.';
+            }
         }
+        printf("| %s", ascii);
+        printf("\n");
+        memset(ascii, 0, sizeof(ascii));
+        i += width;
+    }
 
-        if (col >= width) {
-            sprintf(row + strlen(row), "00 ");
-            sprintf(ascii + strlen(ascii), ".");
-        } else {
-            // Store byte as hex
-            sprintf(row + strlen(row), "%02x ", (unsigned char) ch);
-            // Store byte as ascii
-            sprintf(ascii + strlen(ascii), "%c", isprint(ch) ? (unsigned char) ch : '.');
-        }
-        if (col == 7) {
-            // Inject two spaces to visually break up the line
-            sprintf(row + strlen(row), "  ");
-        }
-        if (col >= 16) {
-            // Dump output / reset counters and strings
-            printf("%s  %s| %s\n", addr, row, ascii);
-            col = 0;
-            row[col] = 0;
-            ascii[col] = 0;
-            addr[col] = 0;
-            continue;
-        }
-        col++;
-    }
-    if (strlen(row)) {
-        // Dump remaining output
-        printf("%s  %s| %s\n", addr, row, ascii);
-    }
 }
 
 int main(int argc, char *argv[]) {
@@ -433,10 +421,10 @@ int main(int argc, char *argv[]) {
                 used_size = handle->fp_size - handle->block_offsets[0];
             }
             if (used_size > 128) {
-                asdfapi_hexdump(block_hdr->data.mem, 128);
+                asdfapi_hexdump(block_hdr->data.mem, 0, 128);
                 puts("[output too long for terminal]");
             } else {
-                asdfapi_hexdump(block_hdr->data.mem, used_size);
+                asdfapi_hexdump(block_hdr->data.mem, 0, used_size);
             }
             puts("\n");
 
