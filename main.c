@@ -369,7 +369,7 @@ static void asdfapi_hexdump(const char *data, const size_t size) {
     if (size < width) {
         width = size;
     }
-    for (size_t b = 0, col = 0; b < 16; b++) {
+    for (size_t b = 0, col = 0; b < size; b++) {
         char ch = data[b];
         if (!col) {
             // Record the starting address
